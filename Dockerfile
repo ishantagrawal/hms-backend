@@ -2,7 +2,7 @@
 FROM rust:1.75-slim AS builder
 WORKDIR /app
 COPY . .
-RUN cargo build --release
+RUN CARGO_BUILD_JOBS=1 cargo build --release
 
 # Stage 2: Run the binary
 FROM debian:bookworm-slim
