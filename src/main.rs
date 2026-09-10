@@ -563,3 +563,12 @@ use tower_http::cors::CorsLayer;
 let app = Router::new()
     // your routes go here, e.g., .route("/api/auth/login", post(login_handler))
     .layer(CorsLayer::permissive()); // This line allows phones and frontends to connect!
+// Example: Seed an initial SuperAdmin if the table is empty
+sqlx::query!(
+    r#"
+    INSERT OR IGNORE INTO users (user_id, full_name, role, institute_name, hostel_block, wing, room, mess_assigned, phone, parent_phone)
+    VALUES ('admin', 'System Admin', 'SuperAdmin', 'Global Network', 'Main', 'A', '000', 'Mess 1', 'admin123', 'admin123')
+    "#
+)
+.execute(&pool)
+.await?;
