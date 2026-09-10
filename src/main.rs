@@ -556,3 +556,10 @@ let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 println!("🚀 HMS Enterprise Backend Online at http://{}", addr);
 axum::serve(listener, app).await.unwrap();
 }
+// Add this at the top with your other imports
+use tower_http::cors::CorsLayer;
+
+// ... down where you create your router:
+let app = Router::new()
+    // your routes go here, e.g., .route("/api/auth/login", post(login_handler))
+    .layer(CorsLayer::permissive()); // This line allows phones and frontends to connect!
