@@ -122,10 +122,11 @@ fn init_db() -> Connection {
     conn.execute("CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, author_name TEXT, title TEXT, content TEXT, category TEXT, date_posted TEXT DEFAULT CURRENT_DATE)", []).unwrap();
     conn.execute("CREATE TABLE IF NOT EXISTS sos_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, wing TEXT, room TEXT, status TEXT DEFAULT 'Active', timestamp TEXT DEFAULT CURRENT_TIMESTAMP)", []).unwrap();
 
+    // Default SuperAdmin Seed Account
     let _ = conn.execute(
         "INSERT OR IGNORE INTO users (user_id, full_name, role, institute_name, hostel_block, wing, room, mess_assigned, phone, parent_phone, password_hash, photo_locked, profile_pic_url, is_exempt) 
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params!["Ishant Agarwal", "Ishant Agarwal", "SuperAdmin", "Global Network", "HQ", "Admin", "Master", "None", "9876543210", "9876543210", "Ishant@1077", 1, "https://api.dicebear.com/7.x/avataaars/svg?seed=Ishant", 0],
+        params!["admin", "Ishant Agrawal", "SuperAdmin", "Global Network", "HQ", "Admin", "Master", "None", "9876543210", "9876543210", "admin123", 1, "https://api.dicebear.com/7.x/avataaars/svg?seed=Ishant", 0],
     );
     conn
 }
@@ -519,6 +520,8 @@ async fn trigger_sos_handler(State(state): State<Arc<AppState>>, Json(payload): 
 async fn main() {
     let conn = init_db();
     let shared_state = Arc::new(AppState { db: Mutex::new(conn), active_otps: Mutex::new(HashMap::new()) });
+    
+    // Proper CORS attachment
     let cors = CorsLayer::permissive();
 
     let app = Router::new()
@@ -547,28 +550,12 @@ async fn main() {
         .route("/api/settings/hostel", get(get_hostel_settings_handler).post(update_hostel_settings_handler))
         .route("/api/notices", get(get_notices_handler).post(post_notice_handler))
         .route("/api/emergency/sos", post(trigger_sos_handler))
-        .with_state(shared_state)
-        .layer(cors);
+        .layer(cors)
+        .with_state(shared_state);
 
-  let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
-let addr = format!("0.0.0.0:{}", port);
-let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-println!("🚀 HMS Enterprise Backend Online at http://{}", addr);
-axum::serve(listener, app).await.unwrap();
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    println!("🚀 HMS Enterprise Backend Online at http://{}", addr);
+    axum::serve(listener, app).await.unwrap();
 }
-// Add this at the top with your other imports
-use tower_http::cors::CorsLayer;
-
-// ... down where you create your router:
-let app = Router::new()
-    // your routes go here, e.g., .route("/api/auth/login", post(login_handler))
-    .layer(CorsLayer::permissive()); // This line allows phones and frontends to connect!
-// Example: Seed an initial SuperAdmin if the table is empty
-sqlx::query!(
-    r#"
-    INSERT OR IGNORE INTO users (user_id, full_name, role, institute_name, hostel_block, wing, room, mess_assigned, phone, parent_phone)
-    VALUES ('admin', 'System Admin', 'SuperAdmin', 'Global Network', 'Main', 'A', '000', 'Mess 1', 'admin123', 'admin123')
-    "#
-)
-.execute(&pool)
-.await?;
