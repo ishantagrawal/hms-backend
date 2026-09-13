@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use libsql::{Builder, Connection, params};
-use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder};
+// FIX: Using the updated v0.11.0 traits and clients (IsahcWebPushClient)
+use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder, IsahcWebPushClient};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
@@ -155,7 +156,6 @@ async fn init_db() -> Connection {
 }
 
 async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<LoginRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
-    // UPGRADE: Now checks BOTH user_id OR phone number for login
     let mut stmt = state.db.query(
         "SELECT u.role, u.password_hash, u.phone, u.institute_name, u.hostel_block, u.wing, u.room, u.full_name, u.parent_phone, u.mess_assigned, u.photo_locked, u.profile_pic_url, COALESCE(s.otp_enabled, 1), u.user_id 
          FROM users u LEFT JOIN institute_settings s ON u.institute_name = s.institute_name 
@@ -165,8 +165,6 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
 
     if let Ok(Some(row)) = stmt.next().await {
         let role: String = row.get(0).unwrap_or_default();
-        
-        // NEW: Block Pending Students
         if role == "PendingStudent" {
             return Ok(Json(serde_json::json!({"success": false, "message": "Your account is waiting for Warden approval."})));
         }
@@ -183,7 +181,7 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
         let locked: i64 = row.get(10).unwrap_or(0);
         let pic: String = row.get(11).unwrap_or_default();
         let otp_int: i64 = row.get(12).unwrap_or(1);
-        let real_user_id: String = row.get(13).unwrap_or_default(); // Get real ID if they logged in with phone
+        let real_user_id: String = row.get(13).unwrap_or_default();
 
         if pass_hash == payload.password || phone == payload.password {
             let user_key = real_user_id.to_lowercase().trim().to_string();
@@ -221,7 +219,6 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
     Ok(Json(serde_json::json!({"success": false, "message": "User not found. Check your User ID or Phone Number."})))
 }
 
-// NEW: STUDENT SIGNUP HANDLER
 async fn signup_handler(State(state): State<Arc<AppState>>, Json(payload): Json<SignupRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let res = state.db.execute(
         "INSERT INTO users (user_id, full_name, role, institute_name, hostel_block, wing, room, mess_assigned, phone, parent_phone, password_hash) 
@@ -235,7 +232,6 @@ async fn signup_handler(State(state): State<Arc<AppState>>, Json(payload): Json<
     }
 }
 
-// NEW: WARDEN APPROVAL HANDLER
 async fn approve_student_handler(State(state): State<Arc<AppState>>, Json(payload): Json<StudentApproval>) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = state.db.execute(
         "UPDATE users SET role = 'Student', mess_assigned = ?1, institute_name = ?2 WHERE user_id = ?3 AND role = 'PendingStudent'", 
@@ -522,6 +518,7 @@ async fn apply_leave_handler(State(state): State<Arc<AppState>>, Json(payload): 
     Ok(Json(serde_json::json!({"success": true, "message": "Leave application dispatched to Warden for authorization."})))
 }
 
+// FIX: Updated Web Push implementation to match version 0.11 APIs
 async fn approve_leave_handler(State(state): State<Arc<AppState>>, Json(payload): Json<LeaveApprovalRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = state.db.execute("UPDATE leave_requests SET status = ?1 WHERE id = ?2", params![payload.status.clone(), payload.leave_id as i64]).await;
     let is_exempt = if payload.status == "Approved" { 1 } else { 0 };
@@ -532,20 +529,23 @@ async fn approve_leave_handler(State(state): State<Arc<AppState>>, Json(payload)
             let sub_json: String = row.get(0).unwrap_or_default();
             if let Ok(sub_info) = serde_json::from_str::<SubscriptionInfo>(&sub_json) {
                 let mut builder = WebPushMessageBuilder::new(&sub_info);
-                let message = serde_json::json!({
+                let message_text = serde_json::json!({
                     "title": "HMS Out-Pass Alert",
                     "body": format!("Your pass request has been {}.", payload.status),
                     "url": "/"
                 }).to_string();
                 
-                builder.set_payload(ContentEncoding::Aes128Gcm, message.as_bytes());
+                builder.set_payload(ContentEncoding::Aes128Gcm, message_text.as_bytes());
                 
-                if let Ok(mut sig_builder) = VapidSignatureBuilder::from_base64_no_sub("zXWEd2mkDsmaXHvNyUM0ecq0_8Qynl0Vml6qScRliEg", web_push::URL_SAFE_NO_PAD) {
-                    sig_builder.add_sub("mailto:admin@hms.com");
+                // LIVE PRIVATE KEY INJECTED HERE (Using the v0.11 builder correctly)
+                if let Ok(partial_sig_builder) = VapidSignatureBuilder::from_base64_no_sub("zXWEd2mkDsmaXHvNyUM0ecq0_8Qynl0Vml6qScRliEg") {
+                    let sig_builder = partial_sig_builder.add_sub_info("mailto:admin@hms.com");
                     if let Ok(signature) = sig_builder.build() {
                         builder.set_vapid_signature(signature);
-                        if let Ok(client) = WebPushClient::new() {
-                            let _ = client.send(builder.build().unwrap()).await;
+                        if let Ok(message) = builder.build() {
+                            if let Ok(client) = IsahcWebPushClient::new() {
+                                let _ = client.send(message).await;
+                            }
                         }
                     }
                 }
