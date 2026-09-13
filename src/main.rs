@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use libsql::{Builder, Connection, params};
-use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder, IsahcWebPushClient};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
@@ -112,9 +111,6 @@ pub struct Notice { pub id: u32, pub author_name: String, pub title: String, pub
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SOSRequest { pub student_id: String, pub student_name: String, pub hostel_block: String, pub wing: String, pub room: String }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PushSubscriptionPayload { pub user_id: String, pub subscription: serde_json::Value }
-
 pub struct AppState {
     pub db: Connection,
     pub active_otps: Mutex<HashMap<String, String>>, 
@@ -137,8 +133,7 @@ async fn init_db() -> Connection {
         "CREATE TABLE IF NOT EXISTS leave_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, student_name TEXT, hostel_block TEXT, wing TEXT, room TEXT, start_date TEXT, end_date TEXT, days_count INTEGER, reason TEXT, status TEXT DEFAULT 'Pending', pass_code TEXT UNIQUE)",
         "CREATE TABLE IF NOT EXISTS hostel_settings (hostel_block TEXT PRIMARY KEY, rebate_rate REAL DEFAULT 120.0)",
         "CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, author_name TEXT, title TEXT, content TEXT, category TEXT, date_posted TEXT DEFAULT CURRENT_DATE)",
-        "CREATE TABLE IF NOT EXISTS sos_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, wing TEXT, room TEXT, status TEXT DEFAULT 'Active', timestamp TEXT DEFAULT CURRENT_TIMESTAMP)",
-        "CREATE TABLE IF NOT EXISTS push_subscriptions (user_id TEXT PRIMARY KEY, subscription_json TEXT)"
+        "CREATE TABLE IF NOT EXISTS sos_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, wing TEXT, room TEXT, status TEXT DEFAULT 'Active', timestamp TEXT DEFAULT CURRENT_TIMESTAMP)"
     ];
 
     for q in queries {
@@ -237,15 +232,6 @@ async fn approve_student_handler(State(state): State<Arc<AppState>>, Json(payloa
         params![payload.mess_assigned, payload.institute_name, payload.user_id]
     ).await;
     Ok(Json(serde_json::json!({"success": true, "message": "Student Approved!"})))
-}
-
-async fn push_subscribe_handler(State(state): State<Arc<AppState>>, Json(payload): Json<PushSubscriptionPayload>) -> Json<serde_json::Value> {
-    let sub_str = payload.subscription.to_string();
-    let _ = state.db.execute(
-        "INSERT INTO push_subscriptions (user_id, subscription_json) VALUES (?1, ?2) ON CONFLICT(user_id) DO UPDATE SET subscription_json = excluded.subscription_json",
-        params![payload.user_id, sub_str]
-    ).await;
-    Json(serde_json::json!({"success": true, "message": "Push subscription stored."}))
 }
 
 async fn get_hostel_settings_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<HostelSettings> {
@@ -521,35 +507,6 @@ async fn approve_leave_handler(State(state): State<Arc<AppState>>, Json(payload)
     let _ = state.db.execute("UPDATE leave_requests SET status = ?1 WHERE id = ?2", params![payload.status.clone(), payload.leave_id as i64]).await;
     let is_exempt = if payload.status == "Approved" { 1 } else { 0 };
     let _ = state.db.execute("UPDATE users SET is_exempt = ?1 WHERE user_id = ?2", params![is_exempt, payload.student_id.clone()]).await;
-
-    if let Ok(mut stmt) = state.db.query("SELECT subscription_json FROM push_subscriptions WHERE user_id = ?1", params![payload.student_id.clone()]).await {
-        if let Ok(Some(row)) = stmt.next().await {
-            let sub_json: String = row.get(0).unwrap_or_default();
-            if let Ok(sub_info) = serde_json::from_str::<SubscriptionInfo>(&sub_json) {
-                let mut builder = WebPushMessageBuilder::new(&sub_info);
-                let message_text = serde_json::json!({
-                    "title": "HMS Out-Pass Alert",
-                    "body": format!("Your pass request has been {}.", payload.status),
-                    "url": "/"
-                }).to_string();
-                
-                builder.set_payload(ContentEncoding::Aes128Gcm, message_text.as_bytes());
-                
-                if let Ok(mut sig_builder) = VapidSignatureBuilder::from_base64_no_sub("zXWEd2mkDsmaXHvNyUM0ecq0_8Qynl0Vml6qScRliEg") {
-                    let sig_builder = sig_builder.add_sub_info(&sub_info);
-                    if let Ok(signature) = sig_builder.build() {
-                        builder.set_vapid_signature(signature);
-                        if let Ok(message) = builder.build() {
-                            if let Ok(client) = IsahcWebPushClient::new() {
-                                let _ = client.send(message).await;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     Ok(Json(serde_json::json!({"success": true, "message": format!("Leave status updated to: {}", payload.status)})))
 }
 
@@ -624,7 +581,6 @@ async fn main() {
         .route("/api/settings/hostel", get(get_hostel_settings_handler).post(update_hostel_settings_handler))
         .route("/api/notices", get(get_notices_handler).post(post_notice_handler))
         .route("/api/emergency/sos", post(trigger_sos_handler))
-        .route("/api/push/subscribe", post(push_subscribe_handler))
         .layer(cors)
         .with_state(shared_state);
 
