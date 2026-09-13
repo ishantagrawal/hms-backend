@@ -117,7 +117,8 @@ pub struct AppState {
 }
 
 async fn init_db() -> Connection {
-    let url = "libsql://hms-db-ishantagrawal.aws-ap-south-1.turso.io".to_string();
+    // FIX: Changed 'libsql://' to 'https://' to prevent stream generation mismatch crashes
+    let url = "https://hms-db-ishantagrawal.aws-ap-south-1.turso.io".to_string();
     let token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODkxNTYxNzIsImlkIjoiMDFhMDkyMDItZmQwMS03NzVjLWFmZDktNjQwOTc3Mzk4MjRjIiwia2lkIjoiYmx1ZUZRQnBpWUREUk9ZeTRsTTZ1UWxTUXlVc0gyWmI4cnR4SGJTc1YtbyIsInJpZCI6ImVhMGZmZTE5LWY2MmUtNDIzZC04ZTc2LWU2N2IxMmQxZGYwNCJ9.YCsqEa6zaBCrCNkheM78qxVj5vXbRmnxtmbdLNrjvsPV_uloDCy0v1EBTjQ0MKoiARXhwxOBECf-DiZGJxbWDA".to_string();
     
     let db = Builder::new_remote(url, token).build().await.expect("Failed to connect to Turso Cloud");
@@ -140,8 +141,7 @@ async fn init_db() -> Connection {
         let _ = conn.execute(q, ()).await;
     }
 
-    // --- NEW: AUTO-MIGRATION SCRIPT ---
-    // These lines will safely add the missing columns to your Turso database without wiping your old data.
+    // Auto-Migration Script
     let _ = conn.execute("ALTER TABLE users ADD COLUMN photo_locked INTEGER DEFAULT 0", ()).await;
     let _ = conn.execute("ALTER TABLE users ADD COLUMN profile_pic_url TEXT DEFAULT ''", ()).await;
     let _ = conn.execute("ALTER TABLE users ADD COLUMN is_exempt INTEGER DEFAULT 0", ()).await;
