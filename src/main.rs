@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use libsql::{Builder, Connection, params};
-// FIX: Using the updated v0.11.0 traits and clients (IsahcWebPushClient)
 use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder, IsahcWebPushClient};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -518,7 +517,6 @@ async fn apply_leave_handler(State(state): State<Arc<AppState>>, Json(payload): 
     Ok(Json(serde_json::json!({"success": true, "message": "Leave application dispatched to Warden for authorization."})))
 }
 
-// FIX: Updated Web Push implementation to match version 0.11 APIs
 async fn approve_leave_handler(State(state): State<Arc<AppState>>, Json(payload): Json<LeaveApprovalRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = state.db.execute("UPDATE leave_requests SET status = ?1 WHERE id = ?2", params![payload.status.clone(), payload.leave_id as i64]).await;
     let is_exempt = if payload.status == "Approved" { 1 } else { 0 };
@@ -537,9 +535,8 @@ async fn approve_leave_handler(State(state): State<Arc<AppState>>, Json(payload)
                 
                 builder.set_payload(ContentEncoding::Aes128Gcm, message_text.as_bytes());
                 
-                // LIVE PRIVATE KEY INJECTED HERE (Using the v0.11 builder correctly)
-                if let Ok(partial_sig_builder) = VapidSignatureBuilder::from_base64_no_sub("zXWEd2mkDsmaXHvNyUM0ecq0_8Qynl0Vml6qScRliEg") {
-                    let sig_builder = partial_sig_builder.add_sub_info("mailto:admin@hms.com");
+                if let Ok(mut sig_builder) = VapidSignatureBuilder::from_base64_no_sub("zXWEd2mkDsmaXHvNyUM0ecq0_8Qynl0Vml6qScRliEg") {
+                    let sig_builder = sig_builder.add_sub_info(&sub_info);
                     if let Ok(signature) = sig_builder.build() {
                         builder.set_vapid_signature(signature);
                         if let Ok(message) = builder.build() {
