@@ -30,15 +30,18 @@ pub struct NewUserRequest {
     pub room: String, pub mess_assigned: String, pub phone: String, pub parent_phone: String,
 }
 
+// FIX: Simplified Signup Request (No Room/Wing needed from student)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SignupRequest {
     pub user_id: String, pub full_name: String, pub hostel_block: String, 
-    pub wing: String, pub room: String, pub phone: String, pub parent_phone: String,
+    pub phone: String, pub parent_phone: String,
 }
 
+// FIX: Warden now provides Wing, Room, and Mess during approval
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StudentApproval {
     pub user_id: String, pub mess_assigned: String, pub institute_name: String,
+    pub wing: String, pub room: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -117,7 +120,6 @@ pub struct AppState {
 }
 
 async fn init_db() -> Connection {
-    // FIX: Changed 'libsql://' to 'https://' to prevent stream generation mismatch crashes
     let url = "https://hms-db-ishantagrawal.aws-ap-south-1.turso.io".to_string();
     let token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODkxNTYxNzIsImlkIjoiMDFhMDkyMDItZmQwMS03NzVjLWFmZDktNjQwOTc3Mzk4MjRjIiwia2lkIjoiYmx1ZUZRQnBpWUREUk9ZeTRsTTZ1UWxTUXlVc0gyWmI4cnR4SGJTc1YtbyIsInJpZCI6ImVhMGZmZTE5LWY2MmUtNDIzZC04ZTc2LWU2N2IxMmQxZGYwNCJ9.YCsqEa6zaBCrCNkheM78qxVj5vXbRmnxtmbdLNrjvsPV_uloDCy0v1EBTjQ0MKoiARXhwxOBECf-DiZGJxbWDA".to_string();
     
@@ -141,7 +143,6 @@ async fn init_db() -> Connection {
         let _ = conn.execute(q, ()).await;
     }
 
-    // Auto-Migration Script
     let _ = conn.execute("ALTER TABLE users ADD COLUMN photo_locked INTEGER DEFAULT 0", ()).await;
     let _ = conn.execute("ALTER TABLE users ADD COLUMN profile_pic_url TEXT DEFAULT ''", ()).await;
     let _ = conn.execute("ALTER TABLE users ADD COLUMN is_exempt INTEGER DEFAULT 0", ()).await;
@@ -223,8 +224,8 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
 async fn signup_handler(State(state): State<Arc<AppState>>, Json(payload): Json<SignupRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let res = state.db.execute(
         "INSERT INTO users (user_id, full_name, role, institute_name, hostel_block, wing, room, mess_assigned, phone, parent_phone, password_hash) 
-         VALUES (?1, ?2, 'PendingStudent', 'Pending', ?3, ?4, ?5, 'Pending', ?6, ?7, ?8)", 
-        params![payload.user_id.clone(), payload.full_name, payload.hostel_block, payload.wing, payload.room, payload.phone.clone(), payload.parent_phone, payload.phone]
+         VALUES (?1, ?2, 'PendingStudent', 'SVNIT Surat', ?3, 'Pending', 'Pending', 'Pending', ?4, ?5, ?6)", 
+        params![payload.user_id.clone(), payload.full_name, payload.hostel_block, payload.phone.clone(), payload.parent_phone, payload.phone]
     ).await;
     
     match res { 
@@ -235,10 +236,10 @@ async fn signup_handler(State(state): State<Arc<AppState>>, Json(payload): Json<
 
 async fn approve_student_handler(State(state): State<Arc<AppState>>, Json(payload): Json<StudentApproval>) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = state.db.execute(
-        "UPDATE users SET role = 'Student', mess_assigned = ?1, institute_name = ?2 WHERE user_id = ?3 AND role = 'PendingStudent'", 
-        params![payload.mess_assigned, payload.institute_name, payload.user_id]
+        "UPDATE users SET role = 'Student', mess_assigned = ?1, institute_name = ?2, wing = ?3, room = ?4 WHERE user_id = ?5 AND role = 'PendingStudent'", 
+        params![payload.mess_assigned, payload.institute_name, payload.wing, payload.room, payload.user_id]
     ).await;
-    Ok(Json(serde_json::json!({"success": true, "message": "Student Approved!"})))
+    Ok(Json(serde_json::json!({"success": true, "message": "Student Approved successfully!"})))
 }
 
 async fn get_hostel_settings_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<HostelSettings> {
