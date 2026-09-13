@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use libsql::{Builder, Connection, params};
+use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
@@ -28,6 +29,17 @@ pub struct NewUserRequest {
     pub user_id: String, pub full_name: String, pub role: String,
     pub institute_name: String, pub hostel_block: String, pub wing: String,
     pub room: String, pub mess_assigned: String, pub phone: String, pub parent_phone: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SignupRequest {
+    pub user_id: String, pub full_name: String, pub hostel_block: String, 
+    pub wing: String, pub room: String, pub phone: String, pub parent_phone: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StudentApproval {
+    pub user_id: String, pub mess_assigned: String, pub institute_name: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -143,15 +155,22 @@ async fn init_db() -> Connection {
 }
 
 async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<LoginRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
+    // UPGRADE: Now checks BOTH user_id OR phone number for login
     let mut stmt = state.db.query(
-        "SELECT u.role, u.password_hash, u.phone, u.institute_name, u.hostel_block, u.wing, u.room, u.full_name, u.parent_phone, u.mess_assigned, u.photo_locked, u.profile_pic_url, COALESCE(s.otp_enabled, 1) 
+        "SELECT u.role, u.password_hash, u.phone, u.institute_name, u.hostel_block, u.wing, u.room, u.full_name, u.parent_phone, u.mess_assigned, u.photo_locked, u.profile_pic_url, COALESCE(s.otp_enabled, 1), u.user_id 
          FROM users u LEFT JOIN institute_settings s ON u.institute_name = s.institute_name 
-         WHERE TRIM(LOWER(u.user_id)) = TRIM(LOWER(?1))",
+         WHERE TRIM(LOWER(u.user_id)) = TRIM(LOWER(?1)) OR TRIM(u.phone) = TRIM(?1)",
         params![payload.username.clone()]
     ).await.unwrap();
 
     if let Ok(Some(row)) = stmt.next().await {
         let role: String = row.get(0).unwrap_or_default();
+        
+        // NEW: Block Pending Students
+        if role == "PendingStudent" {
+            return Ok(Json(serde_json::json!({"success": false, "message": "Your account is waiting for Warden approval."})));
+        }
+
         let pass_hash: String = row.get(1).unwrap_or_default();
         let phone: String = row.get(2).unwrap_or_default();
         let institute: String = row.get(3).unwrap_or_default();
@@ -164,9 +183,10 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
         let locked: i64 = row.get(10).unwrap_or(0);
         let pic: String = row.get(11).unwrap_or_default();
         let otp_int: i64 = row.get(12).unwrap_or(1);
+        let real_user_id: String = row.get(13).unwrap_or_default(); // Get real ID if they logged in with phone
 
         if pass_hash == payload.password || phone == payload.password {
-            let user_key = payload.username.to_lowercase().trim().to_string();
+            let user_key = real_user_id.to_lowercase().trim().to_string();
             let otp_enabled = otp_int != 0; 
             let require_otp = role != "SuperAdmin" && otp_enabled;
 
@@ -174,13 +194,6 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
                 let time_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
                 let generated_otp = format!("{:06}", time_nanos % 1000000);
                 state.active_otps.lock().unwrap().insert(user_key, generated_otp.clone());
-                
-                println!("========================================");
-                println!("🟢 [WHATSAPP BUSINESS API SIMULATION]");
-                println!("To Phone: {}", phone);
-                println!("Message: Your HMS Portal Login OTP is: {}", generated_otp);
-                println!("========================================");
-
                 return Ok(Json(serde_json::json!({"success": true, "require_otp": true, "message": format!("WhatsApp OTP sent to {}.", phone)})));
             }
 
@@ -193,19 +206,42 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
             if is_valid_otp {
                 state.active_otps.lock().unwrap().remove(&user_key);
                 return Ok(Json(serde_json::json!({
-                    "success": true, "require_otp": false, "role": role, "user_id": payload.username,
+                    "success": true, "require_otp": false, "role": role, "user_id": real_user_id,
                     "full_name": full_name, "parent_phone": parent_phone, "mess_assigned": mess,
                     "institute_name": institute, "hostel_block": hostel, "wing": wing,
                     "room": room, "phone": phone, "profile_pic_url": pic, "photo_locked": locked != 0,
-                    "token": format!("HMS_TOKEN_{}", payload.username)
+                    "token": format!("HMS_TOKEN_{}", real_user_id)
                 })));
             } else {
                 return Ok(Json(serde_json::json!({"success": false, "message": "Incorrect OTP."})));
             }
         }
-        return Ok(Json(serde_json::json!({"success": false, "message": "Invalid Username or Password."})));
+        return Ok(Json(serde_json::json!({"success": false, "message": "Invalid Password."})));
     }
-    Ok(Json(serde_json::json!({"success": false, "message": "User not found."})))
+    Ok(Json(serde_json::json!({"success": false, "message": "User not found. Check your User ID or Phone Number."})))
+}
+
+// NEW: STUDENT SIGNUP HANDLER
+async fn signup_handler(State(state): State<Arc<AppState>>, Json(payload): Json<SignupRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let res = state.db.execute(
+        "INSERT INTO users (user_id, full_name, role, institute_name, hostel_block, wing, room, mess_assigned, phone, parent_phone, password_hash) 
+         VALUES (?1, ?2, 'PendingStudent', 'Pending', ?3, ?4, ?5, 'Pending', ?6, ?7, ?8)", 
+        params![payload.user_id.clone(), payload.full_name, payload.hostel_block, payload.wing, payload.room, payload.phone.clone(), payload.parent_phone, payload.phone]
+    ).await;
+    
+    match res { 
+        Ok(_) => Ok(Json(serde_json::json!({"success": true, "message": "Registration successful! Waiting for Warden approval."}))), 
+        Err(_) => Ok(Json(serde_json::json!({"success": false, "message": "User ID or Phone already exists."}))) 
+    }
+}
+
+// NEW: WARDEN APPROVAL HANDLER
+async fn approve_student_handler(State(state): State<Arc<AppState>>, Json(payload): Json<StudentApproval>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = state.db.execute(
+        "UPDATE users SET role = 'Student', mess_assigned = ?1, institute_name = ?2 WHERE user_id = ?3 AND role = 'PendingStudent'", 
+        params![payload.mess_assigned, payload.institute_name, payload.user_id]
+    ).await;
+    Ok(Json(serde_json::json!({"success": true, "message": "Student Approved!"})))
 }
 
 async fn push_subscribe_handler(State(state): State<Arc<AppState>>, Json(payload): Json<PushSubscriptionPayload>) -> Json<serde_json::Value> {
@@ -491,11 +527,31 @@ async fn approve_leave_handler(State(state): State<Arc<AppState>>, Json(payload)
     let is_exempt = if payload.status == "Approved" { 1 } else { 0 };
     let _ = state.db.execute("UPDATE users SET is_exempt = ?1 WHERE user_id = ?2", params![is_exempt, payload.student_id.clone()]).await;
 
-    println!("========================================");
-    println!("🔔 [WEB PUSH SIGNAL DISPATCHED]");
-    println!("Target User: {}", payload.student_id);
-    println!("Notification: Out-Pass Request has been {}", payload.status);
-    println!("========================================");
+    if let Ok(mut stmt) = state.db.query("SELECT subscription_json FROM push_subscriptions WHERE user_id = ?1", params![payload.student_id.clone()]).await {
+        if let Ok(Some(row)) = stmt.next().await {
+            let sub_json: String = row.get(0).unwrap_or_default();
+            if let Ok(sub_info) = serde_json::from_str::<SubscriptionInfo>(&sub_json) {
+                let mut builder = WebPushMessageBuilder::new(&sub_info);
+                let message = serde_json::json!({
+                    "title": "HMS Out-Pass Alert",
+                    "body": format!("Your pass request has been {}.", payload.status),
+                    "url": "/"
+                }).to_string();
+                
+                builder.set_payload(ContentEncoding::Aes128Gcm, message.as_bytes());
+                
+                if let Ok(mut sig_builder) = VapidSignatureBuilder::from_base64_no_sub("zXWEd2mkDsmaXHvNyUM0ecq0_8Qynl0Vml6qScRliEg", web_push::URL_SAFE_NO_PAD) {
+                    sig_builder.add_sub("mailto:admin@hms.com");
+                    if let Ok(signature) = sig_builder.build() {
+                        builder.set_vapid_signature(signature);
+                        if let Ok(client) = WebPushClient::new() {
+                            let _ = client.send(builder.build().unwrap()).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({"success": true, "message": format!("Leave status updated to: {}", payload.status)})))
 }
@@ -545,10 +601,12 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/auth/login", post(login_handler))
+        .route("/api/auth/signup", post(signup_handler))
         .route("/api/users", get(get_users_handler))
         .route("/api/admin/add-user", post(add_user_handler))
         .route("/api/admin/bulk-upload", post(bulk_upload_handler))
         .route("/api/admin/edit-user", post(edit_user_handler))
+        .route("/api/admin/approve-student", post(approve_student_handler))
         .route("/api/admin/delete-user/:id", delete(delete_user_handler))
         .route("/api/admin/toggle-exemption", post(toggle_exemption_handler))
         .route("/api/admin/toggle-institute-otp", post(toggle_institute_otp_handler))
