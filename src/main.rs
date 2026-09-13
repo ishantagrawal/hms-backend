@@ -140,6 +140,13 @@ async fn init_db() -> Connection {
         let _ = conn.execute(q, ()).await;
     }
 
+    // --- NEW: AUTO-MIGRATION SCRIPT ---
+    // These lines will safely add the missing columns to your Turso database without wiping your old data.
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN photo_locked INTEGER DEFAULT 0", ()).await;
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN profile_pic_url TEXT DEFAULT ''", ()).await;
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN is_exempt INTEGER DEFAULT 0", ()).await;
+    let _ = conn.execute("ALTER TABLE leave_requests ADD COLUMN pass_code TEXT", ()).await;
+
     let _ = conn.execute(
         "INSERT OR IGNORE INTO users (user_id, full_name, role, institute_name, hostel_block, wing, room, mess_assigned, phone, parent_phone, password_hash, photo_locked, profile_pic_url, is_exempt) 
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
