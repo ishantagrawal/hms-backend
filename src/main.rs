@@ -175,7 +175,7 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
         let locked: i64 = row.get(10).unwrap_or(0);
         let pic: String = row.get(11).unwrap_or_default();
         let otp_int: i64 = row.get(12).unwrap_or(1);
-        let real_user_id: String = row.get(13).unwrap_or_default();
+        let real_user_id: String = row.get(13).unwrap_or_default(); 
 
         if pass_hash == payload.password || phone == payload.password {
             let user_key = real_user_id.to_lowercase().trim().to_string();
@@ -507,6 +507,7 @@ async fn approve_leave_handler(State(state): State<Arc<AppState>>, Json(payload)
     let _ = state.db.execute("UPDATE leave_requests SET status = ?1 WHERE id = ?2", params![payload.status.clone(), payload.leave_id as i64]).await;
     let is_exempt = if payload.status == "Approved" { 1 } else { 0 };
     let _ = state.db.execute("UPDATE users SET is_exempt = ?1 WHERE user_id = ?2", params![is_exempt, payload.student_id.clone()]).await;
+
     Ok(Json(serde_json::json!({"success": true, "message": format!("Leave status updated to: {}", payload.status)})))
 }
 
