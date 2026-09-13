@@ -100,14 +100,14 @@ pub struct Notice { pub id: u32, pub author_name: String, pub title: String, pub
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SOSRequest { pub student_id: String, pub student_name: String, pub hostel_block: String, pub wing: String, pub room: String }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PushSubscriptionPayload { pub user_id: String, pub subscription: serde_json::Value }
+
 pub struct AppState {
     pub db: Connection,
     pub active_otps: Mutex<HashMap<String, String>>, 
 }
 
-// ---------------------------------------------------------
-// DATABASE INITIALIZATION (TURSO CLOUD)
-// ---------------------------------------------------------
 async fn init_db() -> Connection {
     let url = "libsql://hms-db-ishantagrawal.aws-ap-south-1.turso.io".to_string();
     let token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODkxNTYxNzIsImlkIjoiMDFhMDkyMDItZmQwMS03NzVjLWFmZDktNjQwOTc3Mzk4MjRjIiwia2lkIjoiYmx1ZUZRQnBpWUREUk9ZeTRsTTZ1UWxTUXlVc0gyWmI4cnR4SGJTc1YtbyIsInJpZCI6ImVhMGZmZTE5LWY2MmUtNDIzZC04ZTc2LWU2N2IxMmQxZGYwNCJ9.YCsqEa6zaBCrCNkheM78qxVj5vXbRmnxtmbdLNrjvsPV_uloDCy0v1EBTjQ0MKoiARXhwxOBECf-DiZGJxbWDA".to_string();
@@ -125,7 +125,8 @@ async fn init_db() -> Connection {
         "CREATE TABLE IF NOT EXISTS leave_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, student_name TEXT, hostel_block TEXT, wing TEXT, room TEXT, start_date TEXT, end_date TEXT, days_count INTEGER, reason TEXT, status TEXT DEFAULT 'Pending', pass_code TEXT UNIQUE)",
         "CREATE TABLE IF NOT EXISTS hostel_settings (hostel_block TEXT PRIMARY KEY, rebate_rate REAL DEFAULT 120.0)",
         "CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, author_name TEXT, title TEXT, content TEXT, category TEXT, date_posted TEXT DEFAULT CURRENT_DATE)",
-        "CREATE TABLE IF NOT EXISTS sos_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, wing TEXT, room TEXT, status TEXT DEFAULT 'Active', timestamp TEXT DEFAULT CURRENT_TIMESTAMP)"
+        "CREATE TABLE IF NOT EXISTS sos_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, wing TEXT, room TEXT, status TEXT DEFAULT 'Active', timestamp TEXT DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS push_subscriptions (user_id TEXT PRIMARY KEY, subscription_json TEXT)"
     ];
 
     for q in queries {
@@ -140,10 +141,6 @@ async fn init_db() -> Connection {
 
     conn
 }
-
-// ---------------------------------------------------------
-// ROUTE HANDLERS
-// ---------------------------------------------------------
 
 async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<LoginRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut stmt = state.db.query(
@@ -209,6 +206,15 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
         return Ok(Json(serde_json::json!({"success": false, "message": "Invalid Username or Password."})));
     }
     Ok(Json(serde_json::json!({"success": false, "message": "User not found."})))
+}
+
+async fn push_subscribe_handler(State(state): State<Arc<AppState>>, Json(payload): Json<PushSubscriptionPayload>) -> Json<serde_json::Value> {
+    let sub_str = payload.subscription.to_string();
+    let _ = state.db.execute(
+        "INSERT INTO push_subscriptions (user_id, subscription_json) VALUES (?1, ?2) ON CONFLICT(user_id) DO UPDATE SET subscription_json = excluded.subscription_json",
+        params![payload.user_id, sub_str]
+    ).await;
+    Json(serde_json::json!({"success": true, "message": "Push subscription stored."}))
 }
 
 async fn get_hostel_settings_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<HostelSettings> {
@@ -483,7 +489,14 @@ async fn apply_leave_handler(State(state): State<Arc<AppState>>, Json(payload): 
 async fn approve_leave_handler(State(state): State<Arc<AppState>>, Json(payload): Json<LeaveApprovalRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = state.db.execute("UPDATE leave_requests SET status = ?1 WHERE id = ?2", params![payload.status.clone(), payload.leave_id as i64]).await;
     let is_exempt = if payload.status == "Approved" { 1 } else { 0 };
-    let _ = state.db.execute("UPDATE users SET is_exempt = ?1 WHERE user_id = ?2", params![is_exempt, payload.student_id]).await;
+    let _ = state.db.execute("UPDATE users SET is_exempt = ?1 WHERE user_id = ?2", params![is_exempt, payload.student_id.clone()]).await;
+
+    println!("========================================");
+    println!("🔔 [WEB PUSH SIGNAL DISPATCHED]");
+    println!("Target User: {}", payload.student_id);
+    println!("Notification: Out-Pass Request has been {}", payload.status);
+    println!("========================================");
+
     Ok(Json(serde_json::json!({"success": true, "message": format!("Leave status updated to: {}", payload.status)})))
 }
 
@@ -556,6 +569,7 @@ async fn main() {
         .route("/api/settings/hostel", get(get_hostel_settings_handler).post(update_hostel_settings_handler))
         .route("/api/notices", get(get_notices_handler).post(post_notice_handler))
         .route("/api/emergency/sos", post(trigger_sos_handler))
+        .route("/api/push/subscribe", post(push_subscribe_handler))
         .layer(cors)
         .with_state(shared_state);
 
