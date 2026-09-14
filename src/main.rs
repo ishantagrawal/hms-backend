@@ -454,17 +454,18 @@ async fn smart_search_handler(State(state): State<Arc<AppState>>, Query(query): 
     Json(results)
 }
 
-// 🟢 FIX: When a student marks present, their consecutive misses reset to 0
-async fn mark_present_handler(State(state): State<Arc<AppState>>, Json(payload): Json<MarkAttendanceRequest>) -> Json<serde_json::Value> {
+fn mark_present_handler(State(state): State<Arc<AppState>>, Json(payload): Json<MarkAttendanceRequest>) -> Json<serde_json::Value> {
+    // Left synchronous to avoid cloning issues on some versions of axum
     if let Ok(conn) = state.db.connect() {
-        let _ = conn.execute("INSERT INTO attendance (student_id, meal_type) VALUES (?1, ?2)", params![payload.student_id.clone(), payload.meal_type]).await;
-        // Reset the tracker upon attendance!
-        let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![payload.student_id.clone()]).await;
+        let mut rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let _ = conn.execute("INSERT INTO attendance (student_id, meal_type) VALUES (?1, ?2)", params![payload.student_id.clone(), payload.meal_type]).await;
+            let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![payload.student_id.clone()]).await;
+        });
     }
     Json(serde_json::json!({"success": true, "message": format!("{} marked present.", payload.student_id)}))
 }
 
-// 🟢 FIX: Provides the critical absentees to the Warden Dashboard
 async fn get_critical_absentees_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<Vec<CriticalAbsentee>> {
     let hostel = query.q.unwrap_or_default();
     let mut absentees = Vec::new();
@@ -485,7 +486,6 @@ async fn get_critical_absentees_handler(State(state): State<Arc<AppState>>, Quer
     Json(absentees)
 }
 
-// 🟢 FIX: Allows the Warden to manually clear the alarm for a student if needed
 async fn reset_misses_handler(State(state): State<Arc<AppState>>, Path(user_id): Path<String>) -> Json<serde_json::Value> {
     if let Ok(conn) = state.db.connect() {
         let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![user_id.clone()]).await;
@@ -499,19 +499,17 @@ async fn get_complaints_handler(State(state): State<Arc<AppState>>, Query(query)
     
     let mut comps = Vec::new();
     if let Ok(conn) = state.db.connect() {
-        let mut result = None;
-        
-        if role.starts_with("MaintenanceStaff_") {
+        let result = if role.starts_with("MaintenanceStaff_") {
             let sql = "SELECT id, student_id, student_name, hostel_block, wing, room, category, description, status FROM complaints WHERE (?1 = '' OR hostel_block = ?1) AND status = 'Active'";
-            result = conn.query(sql, params![filter.clone()]).await.ok();
+            conn.query(sql, params![filter.clone()]).await.ok()
         } else if role.starts_with("Student_") {
             let student_id = role.replace("Student_", "");
             let sql = "SELECT id, student_id, student_name, hostel_block, wing, room, category, description, status FROM complaints WHERE student_id = ?1";
-            result = conn.query(sql, params![student_id]).await.ok();
+            conn.query(sql, params![student_id]).await.ok()
         } else {
             let sql = "SELECT id, student_id, student_name, hostel_block, wing, room, category, description, status FROM complaints WHERE (?1 = '' OR hostel_block = ?1)";
-            result = conn.query(sql, params![filter.clone()]).await.ok();
-        }
+            conn.query(sql, params![filter.clone()]).await.ok()
+        };
 
         if let Some(mut stmt) = result {
             while let Ok(Some(row)) = stmt.next().await {
@@ -653,17 +651,15 @@ async fn trigger_sos_handler(State(state): State<Arc<AppState>>, Json(payload): 
 #[tokio::main]
 async fn main() {
     let conn = init_db().await;
+    let shared_state = Arc::new(AppState { db: conn, active_otps: Mutex::new(HashMap::new()) });
     
-    // 🟢 FIX: FULLY AUTOMATIC BACKGROUND SWEEP SYSTEM
-    // This runs automatically in the background without needing a user to click any buttons.
-    let db_bg = conn.clone();
+    // Create a safe background connection using the Arc wrapped connection space
+    let state_bg = Arc::clone(&shared_state);
     tokio::spawn(async move {
         loop {
-            // Checks every 60 seconds to see if a meal timer has ended
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             
-            if let Ok(c) = db_bg.connect() {
-                // Find all meal timers that have just ended but haven't been tracked yet today
+            if let Ok(c) = state_bg.db.connect() {
                 let mut ended_meals = Vec::new();
                 if let Ok(mut stmt) = c.query("SELECT timer_type FROM timers WHERE end_time <= time('now', 'localtime') AND timer_type != 'Hostel Gate' AND timer_type NOT IN (SELECT meal_type FROM processed_meals WHERE date = CURRENT_DATE)", ()).await {
                     while let Ok(Some(row)) = stmt.next().await {
@@ -672,16 +668,10 @@ async fn main() {
                 }
                 
                 for meal in ended_meals {
-                    // 1. Mark this meal as officially "Processed" so it doesn't run again today
                     let _ = c.execute("INSERT INTO processed_meals (date, meal_type) VALUES (CURRENT_DATE, ?1)", params![meal.clone()]).await;
-                    
-                    // 2. Increment the missing counter for ANY student who is NOT exempt and NOT present
                     let _ = c.execute("UPDATE users SET consecutive_misses = consecutive_misses + 1 WHERE role = 'Student' AND is_exempt = 0 AND user_id NOT IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![meal.clone()]).await;
-                    
-                    // 3. Reset the missing counter for anyone who DID show up
                     let _ = c.execute("UPDATE users SET consecutive_misses = 0 WHERE role = 'Student' AND user_id IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![meal.clone()]).await;
                     
-                    // 4. AUTOMATIC ALERT TRIGGER (Fires when they reach their 3rd skipped meal)
                     if let Ok(mut stmt) = c.query("SELECT user_id, full_name, parent_phone, consecutive_misses FROM users WHERE role = 'Student' AND consecutive_misses >= 3", ()).await {
                         while let Ok(Some(row)) = stmt.next().await {
                             let uid: String = row.get(0).unwrap_or_default();
@@ -689,7 +679,6 @@ async fn main() {
                             let phone: String = row.get(2).unwrap_or_default();
                             let misses: i64 = row.get(3).unwrap_or(0);
                             
-                            // This replaces the manual API and executes silently on the server!
                             println!("========================================");
                             println!("🔴 [AUTOMATED SYSTEM] CRITICAL ABSENCE DETECTED");
                             println!("Dispatching SMS to {}: 'ALERT: {} ({}) has missed {} consecutive meals. Please contact the Warden immediately.'", phone, name, uid, misses);
@@ -701,7 +690,6 @@ async fn main() {
         }
     });
 
-    let shared_state = Arc::new(AppState { db: conn, active_otps: Mutex::new(HashMap::new()) });
     let cors = CorsLayer::permissive();
 
     let app = Router::new()
@@ -721,8 +709,8 @@ async fn main() {
         .route("/api/ai/insights", get(get_ai_insights_handler))
         .route("/api/mess/search", get(smart_search_handler))
         .route("/api/mess/mark", post(mark_present_handler))
-        .route("/api/warden/critical-absentees", get(get_critical_absentees_handler)) // New Route
-        .route("/api/warden/reset-misses/:user_id", post(reset_misses_handler)) // New Route
+        .route("/api/warden/critical-absentees", get(get_critical_absentees_handler))
+        .route("/api/warden/reset-misses/:user_id", post(reset_misses_handler))
         .route("/api/complaints", get(get_complaints_handler).post(raise_complaint_handler))
         .route("/api/complaints/resolve/:id", post(resolve_complaint_handler))
         .route("/api/fines", get(get_fines_handler).post(issue_fine_handler))
