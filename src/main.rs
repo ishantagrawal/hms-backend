@@ -471,12 +471,25 @@ async fn trigger_sweep_handler(State(state): State<Arc<AppState>>, Json(payload)
 async fn get_complaints_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<Vec<Complaint>> {
     let filter = query.hostel_filter.unwrap_or_default();
     let role = query.role_filter.unwrap_or_default();
-    let mut sql = "SELECT id, student_id, student_name, hostel_block, wing, room, category, description, status FROM complaints WHERE (?1 = '' OR hostel_block = ?1)".to_string();
-    if role.starts_with("MaintenanceStaff_") { sql.push_str(" AND status = 'Active'"); }
     
     let mut comps = Vec::new();
     if let Ok(conn) = state.db.connect() {
-        if let Ok(mut stmt) = conn.query(&sql, params![filter]).await {
+        let mut result = None;
+        
+        // SECURE FILTER: Ensures Students only pull their own tickets, Wardens see all, Maintenance sees Active
+        if role.starts_with("MaintenanceStaff_") {
+            let sql = "SELECT id, student_id, student_name, hostel_block, wing, room, category, description, status FROM complaints WHERE (?1 = '' OR hostel_block = ?1) AND status = 'Active'";
+            result = conn.query(sql, params![filter.clone()]).await.ok();
+        } else if role.starts_with("Student_") {
+            let student_id = role.replace("Student_", "");
+            let sql = "SELECT id, student_id, student_name, hostel_block, wing, room, category, description, status FROM complaints WHERE student_id = ?1";
+            result = conn.query(sql, params![student_id]).await.ok();
+        } else {
+            let sql = "SELECT id, student_id, student_name, hostel_block, wing, room, category, description, status FROM complaints WHERE (?1 = '' OR hostel_block = ?1)";
+            result = conn.query(sql, params![filter.clone()]).await.ok();
+        }
+
+        if let Some(mut stmt) = result {
             while let Ok(Some(row)) = stmt.next().await {
                 let cat: String = row.get(6).unwrap_or_default();
                 if role.starts_with("MaintenanceStaff_") {
