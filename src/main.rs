@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use libsql::{Builder, Database, params};
-use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushMessageBuilder, WebPushClient};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
@@ -52,6 +51,9 @@ pub struct EditUserRequest {
 pub struct ExemptionRequest { pub user_id: String, pub is_exempt: bool }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InstituteOtpToggle { pub institute_name: String, pub otp_enabled: bool }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SearchQuery { pub q: Option<String>, pub mess_filter: Option<String>, pub wing_filter: Option<String>, pub hostel_filter: Option<String>, pub role_filter: Option<String> }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -61,11 +63,7 @@ pub struct MarkAttendanceRequest { pub student_id: String, pub meal_type: String
 pub struct Timer { pub hostel_block: String, pub timer_type: String, pub start_time: String, pub end_time: String }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Complaint { 
-    pub id: u32, pub student_id: String, pub student_name: String, 
-    pub hostel_block: String, pub wing: String, pub room: String, 
-    pub category: String, pub description: String, pub status: String 
-}
+pub struct Complaint { pub id: u32, pub student_id: String, pub student_name: String, pub hostel_block: String, pub wing: String, pub room: String, pub category: String, pub description: String, pub status: String }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PicPayload { pub user_id: String, pub profile_pic_url: String }
@@ -130,34 +128,6 @@ async fn init_db() -> Database {
     db 
 }
 
-// SECURE BACKGROUND PUSH NOTIFICATIONS
-async fn send_web_push(db: &Database, target_user_id: &str, title: &str, body: &str) {
-    if let Ok(conn) = db.connect() {
-        if let Ok(mut stmt) = conn.query("SELECT subscription_json FROM push_subscriptions WHERE user_id = ?1", params![target_user_id.to_string()]).await {
-            if let Ok(Some(row)) = stmt.next().await {
-                let sub_json: String = row.get(0).unwrap_or_default();
-                if let Ok(sub_info) = serde_json::from_str::<SubscriptionInfo>(&sub_json) {
-                    let mut builder = WebPushMessageBuilder::new(&sub_info);
-                    let payload = serde_json::json!({"title": title, "body": body, "url": "/"}).to_string();
-                    builder.set_payload(ContentEncoding::Aes128Gcm, payload.as_bytes());
-                    
-                    if let Ok(mut sig_builder) = VapidSignatureBuilder::from_base64_no_sub("zXWEd2mkDsmaXHvNyUM0ecq0_8Qynl0Vml6qScRliEg", web_push::URL_SAFE_NO_PAD) {
-                        sig_builder.add_sub("mailto:admin@hms.com");
-                        if let Ok(signature) = sig_builder.build() {
-                            builder.set_vapid_signature(signature);
-                            if let Ok(message) = builder.build() {
-                                if let Ok(client) = WebPushClient::new() {
-                                    let _ = client.send(message).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<LoginRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let conn = match state.db.connect() { Ok(c) => c, Err(_) => return Ok(Json(serde_json::json!({"success": false, "message": "Database waking up. Please click Sign In again."}))) };
     if let Ok(mut stmt) = conn.query("SELECT role, password_hash, phone, institute_name, hostel_block, wing, room, full_name, parent_phone, mess_assigned, photo_locked, profile_pic_url, user_id FROM users WHERE TRIM(LOWER(user_id)) = TRIM(LOWER(?1)) OR TRIM(phone) = TRIM(?1)", params![payload.username.clone()]).await {
@@ -197,7 +167,6 @@ async fn push_subscribe_handler(State(state): State<Arc<AppState>>, Json(payload
 async fn approve_student_handler(State(state): State<Arc<AppState>>, Json(payload): Json<StudentApproval>) -> Result<Json<serde_json::Value>, StatusCode> {
     let conn = state.db.connect().unwrap();
     let _ = conn.execute("UPDATE users SET role = 'Student', mess_assigned = ?1, wing = ?2, room = ?3 WHERE user_id = ?4", params![payload.mess_assigned, payload.wing, payload.room, payload.user_id.clone()]).await;
-    send_web_push(&state.db, &payload.user_id, "Account Approved!", "Your hostel account has been fully activated by the Warden.").await;
     Ok(Json(serde_json::json!({"success": true, "message": "Student Approved successfully!"})))
 }
 
@@ -258,16 +227,7 @@ async fn auto_sweep_handler(State(state): State<Arc<AppState>>, Query(query): Qu
                 let sid: String = row.get(0).unwrap_or_default();
                 let wing: String = row.get(1).unwrap_or_default();
                 let room: String = row.get(2).unwrap_or_default();
-                let name: String = row.get(3).unwrap_or_default();
-                
                 let _ = conn.execute("INSERT INTO system_alerts (student_id, wing, room, alert_type) VALUES (?1, ?2, ?3, '3-Meal Absence Alert')", params![sid.clone(), wing, room]).await;
-                
-                if let Ok(mut wstmt) = conn.query("SELECT user_id FROM users WHERE role = 'Warden' AND hostel_block = ?1", params![hostel.clone()]).await {
-                    if let Ok(Some(wrow)) = wstmt.next().await {
-                        let warden_id: String = wrow.get(0).unwrap_or_default();
-                        send_web_push(&state.db, &warden_id, "🚨 Critical Absence Alert", &format!("{} has missed 3+ meals.", name)).await;
-                    }
-                }
             }
         }
     }
@@ -277,12 +237,6 @@ async fn auto_sweep_handler(State(state): State<Arc<AppState>>, Query(query): Qu
 async fn trigger_sos_handler(State(state): State<Arc<AppState>>, Json(payload): Json<SOSRequest>) -> Json<serde_json::Value> {
     if let Ok(conn) = state.db.connect() {
         let _ = conn.execute("INSERT INTO system_alerts (student_id, wing, room, alert_type) VALUES (?1, ?2, ?3, 'EMERGENCY SOS')", params![payload.student_id.clone(), payload.wing.clone(), payload.room.clone()]).await;
-        if let Ok(mut wstmt) = conn.query("SELECT user_id FROM users WHERE role = 'Warden' AND hostel_block = ?1", params![payload.hostel_block.clone()]).await {
-            if let Ok(Some(wrow)) = wstmt.next().await {
-                let warden_id: String = wrow.get(0).unwrap_or_default();
-                send_web_push(&state.db, &warden_id, "🚨 SOS ACTIVATED", &format!("Location: Wing {}, Room {} ({})", payload.wing, payload.room, payload.student_name)).await;
-            }
-        }
     }
     Json(serde_json::json!({"success": true}))
 }
