@@ -30,7 +30,6 @@ pub struct NewUserRequest {
     pub room: String, pub mess_assigned: String, pub phone: String, pub parent_phone: String,
 }
 
-// FIX: Added institute_name so students can pick their NIT
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SignupRequest {
     pub user_id: String, pub full_name: String, pub institute_name: String, pub hostel_block: String, 
@@ -113,6 +112,16 @@ pub struct Notice { pub id: u32, pub author_name: String, pub title: String, pub
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SOSRequest { pub student_id: String, pub student_name: String, pub hostel_block: String, pub wing: String, pub room: String }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CriticalAbsentee {
+    pub user_id: String,
+    pub full_name: String,
+    pub room: String,
+    pub wing: String,
+    pub consecutive_misses: u32,
+    pub parent_phone: String,
+}
+
 pub struct AppState {
     pub db: Database,
     pub active_otps: Mutex<HashMap<String, String>>, 
@@ -135,7 +144,8 @@ async fn init_db() -> Database {
         "CREATE TABLE IF NOT EXISTS leave_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, student_name TEXT, hostel_block TEXT, wing TEXT, room TEXT, start_date TEXT, end_date TEXT, days_count INTEGER, reason TEXT, status TEXT DEFAULT 'Pending', pass_code TEXT UNIQUE)",
         "CREATE TABLE IF NOT EXISTS hostel_settings (hostel_block TEXT PRIMARY KEY, rebate_rate REAL DEFAULT 120.0)",
         "CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, author_name TEXT, title TEXT, content TEXT, category TEXT, date_posted TEXT DEFAULT CURRENT_DATE)",
-        "CREATE TABLE IF NOT EXISTS sos_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, wing TEXT, room TEXT, status TEXT DEFAULT 'Active', timestamp TEXT DEFAULT CURRENT_TIMESTAMP)"
+        "CREATE TABLE IF NOT EXISTS sos_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, wing TEXT, room TEXT, status TEXT DEFAULT 'Active', timestamp TEXT DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS processed_meals (date TEXT, meal_type TEXT, UNIQUE(date, meal_type))"
     ];
 
     for q in create_queries { let _ = conn.execute(q, ()).await; }
@@ -143,6 +153,7 @@ async fn init_db() -> Database {
     let _ = conn.execute("ALTER TABLE users ADD COLUMN photo_locked INTEGER DEFAULT 0", ()).await;
     let _ = conn.execute("ALTER TABLE users ADD COLUMN profile_pic_url TEXT DEFAULT ''", ()).await;
     let _ = conn.execute("ALTER TABLE users ADD COLUMN is_exempt INTEGER DEFAULT 0", ()).await;
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN consecutive_misses INTEGER DEFAULT 0", ()).await;
     let _ = conn.execute("ALTER TABLE leave_requests ADD COLUMN pass_code TEXT", ()).await;
 
     let _ = conn.execute(
@@ -443,29 +454,43 @@ async fn smart_search_handler(State(state): State<Arc<AppState>>, Query(query): 
     Json(results)
 }
 
+// 🟢 FIX: When a student marks present, their consecutive misses reset to 0
 async fn mark_present_handler(State(state): State<Arc<AppState>>, Json(payload): Json<MarkAttendanceRequest>) -> Json<serde_json::Value> {
     if let Ok(conn) = state.db.connect() {
         let _ = conn.execute("INSERT INTO attendance (student_id, meal_type) VALUES (?1, ?2)", params![payload.student_id.clone(), payload.meal_type]).await;
+        // Reset the tracker upon attendance!
+        let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![payload.student_id.clone()]).await;
     }
     Json(serde_json::json!({"success": true, "message": format!("{} marked present.", payload.student_id)}))
 }
 
-async fn trigger_sweep_handler(State(state): State<Arc<AppState>>, Json(payload): Json<MarkAttendanceRequest>) -> Json<serde_json::Value> {
-    let mut count = 0;
+// 🟢 FIX: Provides the critical absentees to the Warden Dashboard
+async fn get_critical_absentees_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<Vec<CriticalAbsentee>> {
+    let hostel = query.q.unwrap_or_default();
+    let mut absentees = Vec::new();
     if let Ok(conn) = state.db.connect() {
-        if let Ok(mut stmt) = conn.query("SELECT user_id, parent_phone FROM users WHERE role = 'Student' AND is_exempt = 0 AND user_id NOT IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![payload.meal_type.clone()]).await {
-            println!("========================================");
-            println!("🟢 [WHATSAPP BUSINESS AUTOMATED SWEEP]");
+        if let Ok(mut stmt) = conn.query("SELECT user_id, full_name, room, wing, consecutive_misses, parent_phone FROM users WHERE role = 'Student' AND consecutive_misses >= 2 AND hostel_block = ?1 ORDER BY consecutive_misses DESC", params![hostel]).await {
             while let Ok(Some(row)) = stmt.next().await {
-                let id: String = row.get(0).unwrap_or_default();
-                let parent_phone: String = row.get(1).unwrap_or_default();
-                count += 1;
-                println!("Message to +91 {}: *Alert*: Student {} did not record attendance for {}.", parent_phone, id, payload.meal_type);
+                absentees.push(CriticalAbsentee {
+                    user_id: row.get(0).unwrap_or_default(),
+                    full_name: row.get(1).unwrap_or_default(),
+                    room: row.get(2).unwrap_or_default(),
+                    wing: row.get(3).unwrap_or_default(),
+                    consecutive_misses: row.get::<i64>(4).unwrap_or(0) as u32,
+                    parent_phone: row.get(5).unwrap_or_default(),
+                });
             }
-            println!("========================================");
         }
     }
-    Json(serde_json::json!({"success": true, "message": format!("Sweep complete. {} missing students flagged. Automated WhatsApp Alert dispatched.", count)}))
+    Json(absentees)
+}
+
+// 🟢 FIX: Allows the Warden to manually clear the alarm for a student if needed
+async fn reset_misses_handler(State(state): State<Arc<AppState>>, Path(user_id): Path<String>) -> Json<serde_json::Value> {
+    if let Ok(conn) = state.db.connect() {
+        let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![user_id.clone()]).await;
+    }
+    Json(serde_json::json!({"success": true}))
 }
 
 async fn get_complaints_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<Vec<Complaint>> {
@@ -476,7 +501,6 @@ async fn get_complaints_handler(State(state): State<Arc<AppState>>, Query(query)
     if let Ok(conn) = state.db.connect() {
         let mut result = None;
         
-        // SECURE FILTER: Ensures Students only pull their own tickets, Wardens see all, Maintenance sees Active
         if role.starts_with("MaintenanceStaff_") {
             let sql = "SELECT id, student_id, student_name, hostel_block, wing, room, category, description, status FROM complaints WHERE (?1 = '' OR hostel_block = ?1) AND status = 'Active'";
             result = conn.query(sql, params![filter.clone()]).await.ok();
@@ -629,8 +653,55 @@ async fn trigger_sos_handler(State(state): State<Arc<AppState>>, Json(payload): 
 #[tokio::main]
 async fn main() {
     let conn = init_db().await;
-    let shared_state = Arc::new(AppState { db: conn, active_otps: Mutex::new(HashMap::new()) });
     
+    // 🟢 FIX: FULLY AUTOMATIC BACKGROUND SWEEP SYSTEM
+    // This runs automatically in the background without needing a user to click any buttons.
+    let db_bg = conn.clone();
+    tokio::spawn(async move {
+        loop {
+            // Checks every 60 seconds to see if a meal timer has ended
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            
+            if let Ok(c) = db_bg.connect() {
+                // Find all meal timers that have just ended but haven't been tracked yet today
+                let mut ended_meals = Vec::new();
+                if let Ok(mut stmt) = c.query("SELECT timer_type FROM timers WHERE end_time <= time('now', 'localtime') AND timer_type != 'Hostel Gate' AND timer_type NOT IN (SELECT meal_type FROM processed_meals WHERE date = CURRENT_DATE)", ()).await {
+                    while let Ok(Some(row)) = stmt.next().await {
+                        ended_meals.push(row.get::<String>(0).unwrap_or_default());
+                    }
+                }
+                
+                for meal in ended_meals {
+                    // 1. Mark this meal as officially "Processed" so it doesn't run again today
+                    let _ = c.execute("INSERT INTO processed_meals (date, meal_type) VALUES (CURRENT_DATE, ?1)", params![meal.clone()]).await;
+                    
+                    // 2. Increment the missing counter for ANY student who is NOT exempt and NOT present
+                    let _ = c.execute("UPDATE users SET consecutive_misses = consecutive_misses + 1 WHERE role = 'Student' AND is_exempt = 0 AND user_id NOT IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![meal.clone()]).await;
+                    
+                    // 3. Reset the missing counter for anyone who DID show up
+                    let _ = c.execute("UPDATE users SET consecutive_misses = 0 WHERE role = 'Student' AND user_id IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![meal.clone()]).await;
+                    
+                    // 4. AUTOMATIC ALERT TRIGGER (Fires when they reach their 3rd skipped meal)
+                    if let Ok(mut stmt) = c.query("SELECT user_id, full_name, parent_phone, consecutive_misses FROM users WHERE role = 'Student' AND consecutive_misses >= 3", ()).await {
+                        while let Ok(Some(row)) = stmt.next().await {
+                            let uid: String = row.get(0).unwrap_or_default();
+                            let name: String = row.get(1).unwrap_or_default();
+                            let phone: String = row.get(2).unwrap_or_default();
+                            let misses: i64 = row.get(3).unwrap_or(0);
+                            
+                            // This replaces the manual API and executes silently on the server!
+                            println!("========================================");
+                            println!("🔴 [AUTOMATED SYSTEM] CRITICAL ABSENCE DETECTED");
+                            println!("Dispatching SMS to {}: 'ALERT: {} ({}) has missed {} consecutive meals. Please contact the Warden immediately.'", phone, name, uid, misses);
+                            println!("========================================");
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let shared_state = Arc::new(AppState { db: conn, active_otps: Mutex::new(HashMap::new()) });
     let cors = CorsLayer::permissive();
 
     let app = Router::new()
@@ -650,7 +721,8 @@ async fn main() {
         .route("/api/ai/insights", get(get_ai_insights_handler))
         .route("/api/mess/search", get(smart_search_handler))
         .route("/api/mess/mark", post(mark_present_handler))
-        .route("/api/warden/sweep", post(trigger_sweep_handler))
+        .route("/api/warden/critical-absentees", get(get_critical_absentees_handler)) // New Route
+        .route("/api/warden/reset-misses/:user_id", post(reset_misses_handler)) // New Route
         .route("/api/complaints", get(get_complaints_handler).post(raise_complaint_handler))
         .route("/api/complaints/resolve/:id", post(resolve_complaint_handler))
         .route("/api/fines", get(get_fines_handler).post(issue_fine_handler))
