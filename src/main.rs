@@ -125,25 +125,6 @@ async fn init_db() -> Database {
     let db = Builder::new_remote(url, token).build().await.expect("Failed to connect to Turso Cloud");
     let conn = db.connect().expect("Failed to create initial connection");
 
-    // ==========================================
-    // 🚨 HARD RESET: DELETING ALL PREVIOUS DATA 🚨
-    // ==========================================
-    let drop_queries = vec![
-        "DROP TABLE IF EXISTS users",
-        "DROP TABLE IF EXISTS attendance",
-        "DROP TABLE IF EXISTS timers",
-        "DROP TABLE IF EXISTS complaints",
-        "DROP TABLE IF EXISTS institute_settings",
-        "DROP TABLE IF EXISTS fines",
-        "DROP TABLE IF EXISTS leave_requests",
-        "DROP TABLE IF EXISTS hostel_settings",
-        "DROP TABLE IF EXISTS notices",
-        "DROP TABLE IF EXISTS sos_alerts",
-        "DROP TABLE IF EXISTS push_subscriptions"
-    ];
-    for q in drop_queries { let _ = conn.execute(q, ()).await; }
-    // ==========================================
-
     let create_queries = vec![
         "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, full_name TEXT, role TEXT, institute_name TEXT, hostel_block TEXT, wing TEXT, room TEXT, mess_assigned TEXT, phone TEXT, parent_phone TEXT, password_hash TEXT, photo_locked INTEGER DEFAULT 0, profile_pic_url TEXT DEFAULT '', is_exempt INTEGER DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS attendance (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, meal_type TEXT, date_logged TEXT DEFAULT CURRENT_DATE, time_logged TEXT DEFAULT CURRENT_TIMESTAMP)",
@@ -244,7 +225,6 @@ async fn login_handler(State(state): State<Arc<AppState>>, Json(payload): Json<L
 async fn signup_handler(State(state): State<Arc<AppState>>, Json(payload): Json<SignupRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let conn = match state.db.connect() { Ok(c) => c, Err(_) => return Ok(Json(serde_json::json!({"success": false, "message": "Database waking up. Please try again."}))) };
     
-    // FIX: Using dynamic payload.institute_name
     let res = conn.execute(
         "INSERT INTO users (user_id, full_name, role, institute_name, hostel_block, wing, room, mess_assigned, phone, parent_phone, password_hash) 
          VALUES (?1, ?2, 'PendingStudent', ?3, ?4, 'Pending', 'Pending', 'Pending', ?5, ?6, ?7)", 
