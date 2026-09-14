@@ -454,14 +454,11 @@ async fn smart_search_handler(State(state): State<Arc<AppState>>, Query(query): 
     Json(results)
 }
 
-fn mark_present_handler(State(state): State<Arc<AppState>>, Json(payload): Json<MarkAttendanceRequest>) -> Json<serde_json::Value> {
-    // Left synchronous to avoid cloning issues on some versions of axum
+// 🟢 FIX: Re-added async to satisfy axum's Handler trait
+async fn mark_present_handler(State(state): State<Arc<AppState>>, Json(payload): Json<MarkAttendanceRequest>) -> Json<serde_json::Value> {
     if let Ok(conn) = state.db.connect() {
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let _ = conn.execute("INSERT INTO attendance (student_id, meal_type) VALUES (?1, ?2)", params![payload.student_id.clone(), payload.meal_type]).await;
-            let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![payload.student_id.clone()]).await;
-        });
+        let _ = conn.execute("INSERT INTO attendance (student_id, meal_type) VALUES (?1, ?2)", params![payload.student_id.clone(), payload.meal_type]).await;
+        let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![payload.student_id.clone()]).await;
     }
     Json(serde_json::json!({"success": true, "message": format!("{} marked present.", payload.student_id)}))
 }
