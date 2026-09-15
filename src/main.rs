@@ -65,7 +65,6 @@ pub struct MarkAttendanceRequest { pub student_id: String, pub meal_type: String
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Timer { pub hostel_block: String, pub timer_type: String, pub start_time: String, pub end_time: String }
 
-// 🟢 FIX: Added date_logged to Complaint
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Complaint { 
     pub id: u32, pub student_id: String, pub student_name: String, 
@@ -134,7 +133,6 @@ pub struct HostelAbsentee {
     pub parent_phone: String,
 }
 
-// 🟢 FIX: New struct for Historical Absentee Logs
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AbsenteeLog {
     pub id: u32, pub student_id: String, pub student_name: String,
@@ -158,7 +156,7 @@ async fn init_db() -> Database {
         "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, full_name TEXT, role TEXT, institute_name TEXT, hostel_block TEXT, wing TEXT, room TEXT, mess_assigned TEXT, phone TEXT, parent_phone TEXT, password_hash TEXT, photo_locked INTEGER DEFAULT 0, profile_pic_url TEXT DEFAULT '', is_exempt INTEGER DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS attendance (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, meal_type TEXT, date_logged TEXT DEFAULT CURRENT_DATE, time_logged TEXT DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS timers (id INTEGER PRIMARY KEY AUTOINCREMENT, hostel_block TEXT, timer_type TEXT, start_time TEXT, end_time TEXT, UNIQUE(hostel_block, timer_type))",
-        "CREATE TABLE IF NOT EXISTS complaints (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, student_name TEXT, hostel_block TEXT, wing TEXT, room TEXT, category TEXT, description TEXT, status TEXT, date_logged TEXT DEFAULT CURRENT_DATE)",
+        "CREATE TABLE IF NOT EXISTS complaints (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, student_name TEXT, hostel_block TEXT, wing TEXT, room TEXT, category TEXT, description TEXT, status TEXT, date_logged TEXT DEFAULT '')",
         "CREATE TABLE IF NOT EXISTS institute_settings (institute_name TEXT PRIMARY KEY, otp_enabled INTEGER DEFAULT 1)",
         "CREATE TABLE IF NOT EXISTS fines (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, student_name TEXT, hostel_block TEXT, amount REAL, reason TEXT, status TEXT DEFAULT 'Unpaid', date_issued TEXT DEFAULT CURRENT_DATE)",
         "CREATE TABLE IF NOT EXISTS leave_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, student_name TEXT, hostel_block TEXT, wing TEXT, room TEXT, start_date TEXT, end_date TEXT, days_count INTEGER, reason TEXT, status TEXT DEFAULT 'Pending', pass_code TEXT UNIQUE)",
@@ -166,7 +164,6 @@ async fn init_db() -> Database {
         "CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, author_name TEXT, title TEXT, content TEXT, category TEXT, date_posted TEXT DEFAULT CURRENT_DATE)",
         "CREATE TABLE IF NOT EXISTS sos_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, wing TEXT, room TEXT, status TEXT DEFAULT 'Active', timestamp TEXT DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS processed_meals (date TEXT, meal_type TEXT, UNIQUE(date, meal_type))",
-        // 🟢 FIX: Create Absentee Logs Table
         "CREATE TABLE IF NOT EXISTS absentee_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT, student_name TEXT, hostel_block TEXT, wing TEXT, room TEXT, missing_type TEXT, date_missed TEXT DEFAULT CURRENT_DATE)"
     ];
 
@@ -178,8 +175,7 @@ async fn init_db() -> Database {
     let _ = conn.execute("ALTER TABLE users ADD COLUMN consecutive_misses INTEGER DEFAULT 0", ()).await;
     let _ = conn.execute("ALTER TABLE users ADD COLUMN hostel_misses INTEGER DEFAULT 0", ()).await;
     let _ = conn.execute("ALTER TABLE leave_requests ADD COLUMN pass_code TEXT", ()).await;
-    // 🟢 FIX: Ensure existing complaints get a date field if they didn't have one
-    let _ = conn.execute("ALTER TABLE complaints ADD COLUMN date_logged TEXT DEFAULT CURRENT_DATE", ()).await;
+    let _ = conn.execute("ALTER TABLE complaints ADD COLUMN date_logged TEXT DEFAULT ''", ()).await;
 
     let _ = conn.execute(
         "INSERT OR IGNORE INTO users (user_id, full_name, role, institute_name, hostel_block, wing, room, mess_assigned, phone, parent_phone, password_hash, photo_locked, profile_pic_url, is_exempt) 
@@ -546,7 +542,6 @@ async fn reset_hostel_misses_handler(State(state): State<Arc<AppState>>, Path(us
     Json(serde_json::json!({"success": true}))
 }
 
-// 🟢 FIX: Get Historical Absentee Logs for PDF Printing
 async fn get_absentee_logs_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<Vec<AbsenteeLog>> {
     let hostel = query.hostel_filter.unwrap_or_default();
     let mut logs = Vec::new();
@@ -569,7 +564,6 @@ async fn get_absentee_logs_handler(State(state): State<Arc<AppState>>, Query(que
     Json(logs)
 }
 
-// 🟢 FIX: Added date_logged index (9) to Complaint mapping
 async fn get_complaints_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<Vec<Complaint>> {
     let filter = query.hostel_filter.unwrap_or_default();
     let role = query.role_filter.unwrap_or_default();
@@ -747,7 +741,6 @@ async fn main() {
                 for meal in ended_meals {
                     let _ = c.execute("INSERT INTO processed_meals (date, meal_type) VALUES (CURRENT_DATE, ?1)", params![meal.clone()]).await;
                     
-                    // 🟢 FIX: Insert an absentee log for EVERY student that missed the specific meal/curfew today
                     let _ = c.execute("INSERT INTO absentee_logs (student_id, student_name, hostel_block, wing, room, missing_type, date_missed) SELECT user_id, full_name, hostel_block, wing, room, ?1, CURRENT_DATE FROM users WHERE role = 'Student' AND is_exempt = 0 AND user_id NOT IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![meal.clone(), meal.clone()]).await;
 
                     if meal == "Hostel Gate" {
@@ -811,9 +804,9 @@ async fn main() {
         .route("/api/mess/mark", post(mark_present_handler))
         .route("/api/warden/critical-absentees", get(get_critical_absentees_handler))
         .route("/api/warden/reset-misses/:user_id", post(reset_misses_handler))
-        .route("/api/warden/hostel-absentees", get(get_hostel_absentees_handler))
-        .route("/api/warden/reset-hostel-misses/:user_id", post(reset_hostel_misses_handler))
-        .route("/api/reports/absentees", get(get_absentee_logs_handler)) // 🟢 FIX: New PDF absentee route
+        .route("/api/warden/hostel-absentees", get(get_hostel_absentees_handler)) 
+        .route("/api/warden/reset-hostel-misses/:user_id", post(reset_hostel_misses_handler)) 
+        .route("/api/reports/absentees", get(get_absentee_logs_handler)) 
         .route("/api/complaints", get(get_complaints_handler).post(raise_complaint_handler))
         .route("/api/complaints/resolve/:id", post(resolve_complaint_handler))
         .route("/api/fines", get(get_fines_handler).post(issue_fine_handler))
