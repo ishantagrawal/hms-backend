@@ -122,6 +122,16 @@ pub struct CriticalAbsentee {
     pub parent_phone: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HostelAbsentee {
+    pub user_id: String,
+    pub full_name: String,
+    pub room: String,
+    pub wing: String,
+    pub hostel_misses: u32,
+    pub parent_phone: String,
+}
+
 pub struct AppState {
     pub db: Database,
     pub active_otps: Mutex<HashMap<String, String>>, 
@@ -154,6 +164,7 @@ async fn init_db() -> Database {
     let _ = conn.execute("ALTER TABLE users ADD COLUMN profile_pic_url TEXT DEFAULT ''", ()).await;
     let _ = conn.execute("ALTER TABLE users ADD COLUMN is_exempt INTEGER DEFAULT 0", ()).await;
     let _ = conn.execute("ALTER TABLE users ADD COLUMN consecutive_misses INTEGER DEFAULT 0", ()).await;
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN hostel_misses INTEGER DEFAULT 0", ()).await; // NEW: Hostel Night Track
     let _ = conn.execute("ALTER TABLE leave_requests ADD COLUMN pass_code TEXT", ()).await;
 
     let _ = conn.execute(
@@ -454,11 +465,16 @@ async fn smart_search_handler(State(state): State<Arc<AppState>>, Query(query): 
     Json(results)
 }
 
-// 🟢 FIX: Re-added async to satisfy axum's Handler trait
+// 🟢 FIX: Reset logic correctly splits based on Meal vs Gate attendance
 async fn mark_present_handler(State(state): State<Arc<AppState>>, Json(payload): Json<MarkAttendanceRequest>) -> Json<serde_json::Value> {
     if let Ok(conn) = state.db.connect() {
-        let _ = conn.execute("INSERT INTO attendance (student_id, meal_type) VALUES (?1, ?2)", params![payload.student_id.clone(), payload.meal_type]).await;
-        let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![payload.student_id.clone()]).await;
+        let _ = conn.execute("INSERT INTO attendance (student_id, meal_type) VALUES (?1, ?2)", params![payload.student_id.clone(), payload.meal_type.clone()]).await;
+        
+        if payload.meal_type == "Hostel Attendance" {
+            let _ = conn.execute("UPDATE users SET hostel_misses = 0 WHERE user_id = ?1", params![payload.student_id.clone()]).await;
+        } else {
+            let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![payload.student_id.clone()]).await;
+        }
     }
     Json(serde_json::json!({"success": true, "message": format!("{} marked present.", payload.student_id)}))
 }
@@ -486,6 +502,34 @@ async fn get_critical_absentees_handler(State(state): State<Arc<AppState>>, Quer
 async fn reset_misses_handler(State(state): State<Arc<AppState>>, Path(user_id): Path<String>) -> Json<serde_json::Value> {
     if let Ok(conn) = state.db.connect() {
         let _ = conn.execute("UPDATE users SET consecutive_misses = 0 WHERE user_id = ?1", params![user_id.clone()]).await;
+    }
+    Json(serde_json::json!({"success": true}))
+}
+
+// 🟢 FIX: Endpoints for the new Curfew/Night tracker
+async fn get_hostel_absentees_handler(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<Vec<HostelAbsentee>> {
+    let hostel = query.q.unwrap_or_default();
+    let mut absentees = Vec::new();
+    if let Ok(conn) = state.db.connect() {
+        if let Ok(mut stmt) = conn.query("SELECT user_id, full_name, room, wing, hostel_misses, parent_phone FROM users WHERE role = 'Student' AND hostel_misses >= 1 AND hostel_block = ?1 ORDER BY hostel_misses DESC", params![hostel]).await {
+            while let Ok(Some(row)) = stmt.next().await {
+                absentees.push(HostelAbsentee {
+                    user_id: row.get(0).unwrap_or_default(),
+                    full_name: row.get(1).unwrap_or_default(),
+                    room: row.get(2).unwrap_or_default(),
+                    wing: row.get(3).unwrap_or_default(),
+                    hostel_misses: row.get::<i64>(4).unwrap_or(0) as u32,
+                    parent_phone: row.get(5).unwrap_or_default(),
+                });
+            }
+        }
+    }
+    Json(absentees)
+}
+
+async fn reset_hostel_misses_handler(State(state): State<Arc<AppState>>, Path(user_id): Path<String>) -> Json<serde_json::Value> {
+    if let Ok(conn) = state.db.connect() {
+        let _ = conn.execute("UPDATE users SET hostel_misses = 0 WHERE user_id = ?1", params![user_id.clone()]).await;
     }
     Json(serde_json::json!({"success": true}))
 }
@@ -650,7 +694,6 @@ async fn main() {
     let conn = init_db().await;
     let shared_state = Arc::new(AppState { db: conn, active_otps: Mutex::new(HashMap::new()) });
     
-    // Create a safe background connection using the Arc wrapped connection space
     let state_bg = Arc::clone(&shared_state);
     tokio::spawn(async move {
         loop {
@@ -658,7 +701,8 @@ async fn main() {
             
             if let Ok(c) = state_bg.db.connect() {
                 let mut ended_meals = Vec::new();
-                if let Ok(mut stmt) = c.query("SELECT timer_type FROM timers WHERE end_time <= time('now', 'localtime') AND timer_type != 'Hostel Gate' AND timer_type NOT IN (SELECT meal_type FROM processed_meals WHERE date = CURRENT_DATE)", ()).await {
+                // 🟢 FIX: We now scan ALL timers (both Meals and 'Hostel Gate')
+                if let Ok(mut stmt) = c.query("SELECT timer_type FROM timers WHERE end_time <= time('now', 'localtime') AND timer_type NOT IN (SELECT meal_type FROM processed_meals WHERE date = CURRENT_DATE)", ()).await {
                     while let Ok(Some(row)) = stmt.next().await {
                         ended_meals.push(row.get::<String>(0).unwrap_or_default());
                     }
@@ -666,20 +710,44 @@ async fn main() {
                 
                 for meal in ended_meals {
                     let _ = c.execute("INSERT INTO processed_meals (date, meal_type) VALUES (CURRENT_DATE, ?1)", params![meal.clone()]).await;
-                    let _ = c.execute("UPDATE users SET consecutive_misses = consecutive_misses + 1 WHERE role = 'Student' AND is_exempt = 0 AND user_id NOT IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![meal.clone()]).await;
-                    let _ = c.execute("UPDATE users SET consecutive_misses = 0 WHERE role = 'Student' AND user_id IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![meal.clone()]).await;
                     
-                    if let Ok(mut stmt) = c.query("SELECT user_id, full_name, parent_phone, consecutive_misses FROM users WHERE role = 'Student' AND consecutive_misses >= 3", ()).await {
-                        while let Ok(Some(row)) = stmt.next().await {
-                            let uid: String = row.get(0).unwrap_or_default();
-                            let name: String = row.get(1).unwrap_or_default();
-                            let phone: String = row.get(2).unwrap_or_default();
-                            let misses: i64 = row.get(3).unwrap_or(0);
-                            
-                            println!("========================================");
-                            println!("🔴 [AUTOMATED SYSTEM] CRITICAL ABSENCE DETECTED");
-                            println!("Dispatching SMS to {}: 'ALERT: {} ({}) has missed {} consecutive meals. Please contact the Warden immediately.'", phone, name, uid, misses);
-                            println!("========================================");
+                    if meal == "Hostel Gate" {
+                        // 🟢 NIGHT ATTENDANCE TRACKER
+                        let _ = c.execute("UPDATE users SET hostel_misses = hostel_misses + 1 WHERE role = 'Student' AND is_exempt = 0 AND user_id NOT IN (SELECT student_id FROM attendance WHERE meal_type = 'Hostel Attendance' AND date_logged = CURRENT_DATE)", ()).await;
+                        let _ = c.execute("UPDATE users SET hostel_misses = 0 WHERE role = 'Student' AND user_id IN (SELECT student_id FROM attendance WHERE meal_type = 'Hostel Attendance' AND date_logged = CURRENT_DATE)", ()).await;
+
+                        // Alerts immediately (>= 1) for missing night attendance
+                        if let Ok(mut stmt) = c.query("SELECT user_id, full_name, parent_phone, hostel_misses FROM users WHERE role = 'Student' AND hostel_misses >= 1", ()).await {
+                            while let Ok(Some(row)) = stmt.next().await {
+                                let uid: String = row.get(0).unwrap_or_default();
+                                let name: String = row.get(1).unwrap_or_default();
+                                let phone: String = row.get(2).unwrap_or_default();
+                                let misses: i64 = row.get(3).unwrap_or(0);
+                                
+                                println!("========================================");
+                                println!("🌙 [NIGHT TRACKER] CURFEW ABSENCE DETECTED");
+                                println!("Dispatching SMS to {}: 'ALERT: {} ({}) missed hostel night attendance ({} days missing). Please contact the Warden immediately.'", phone, name, uid, misses);
+                                println!("========================================");
+                            }
+                        }
+                    } else {
+                        // 🟢 MEAL TRACKER
+                        let _ = c.execute("UPDATE users SET consecutive_misses = consecutive_misses + 1 WHERE role = 'Student' AND is_exempt = 0 AND user_id NOT IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![meal.clone()]).await;
+                        let _ = c.execute("UPDATE users SET consecutive_misses = 0 WHERE role = 'Student' AND user_id IN (SELECT student_id FROM attendance WHERE meal_type = ?1 AND date_logged = CURRENT_DATE)", params![meal.clone()]).await;
+                        
+                        // Alerts after 3 consecutive skips
+                        if let Ok(mut stmt) = c.query("SELECT user_id, full_name, parent_phone, consecutive_misses FROM users WHERE role = 'Student' AND consecutive_misses >= 3", ()).await {
+                            while let Ok(Some(row)) = stmt.next().await {
+                                let uid: String = row.get(0).unwrap_or_default();
+                                let name: String = row.get(1).unwrap_or_default();
+                                let phone: String = row.get(2).unwrap_or_default();
+                                let misses: i64 = row.get(3).unwrap_or(0);
+                                
+                                println!("========================================");
+                                println!("🔴 [MEAL SYSTEM] CRITICAL ABSENCE DETECTED");
+                                println!("Dispatching SMS to {}: 'ALERT: {} ({}) has missed {} consecutive meals.'", phone, name, uid, misses);
+                                println!("========================================");
+                            }
                         }
                     }
                 }
@@ -708,6 +776,8 @@ async fn main() {
         .route("/api/mess/mark", post(mark_present_handler))
         .route("/api/warden/critical-absentees", get(get_critical_absentees_handler))
         .route("/api/warden/reset-misses/:user_id", post(reset_misses_handler))
+        .route("/api/warden/hostel-absentees", get(get_hostel_absentees_handler)) // 🟢 New Curfew Route
+        .route("/api/warden/reset-hostel-misses/:user_id", post(reset_hostel_misses_handler)) // 🟢 New Curfew Reset
         .route("/api/complaints", get(get_complaints_handler).post(raise_complaint_handler))
         .route("/api/complaints/resolve/:id", post(resolve_complaint_handler))
         .route("/api/fines", get(get_fines_handler).post(issue_fine_handler))
